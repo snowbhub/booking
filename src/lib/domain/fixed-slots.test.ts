@@ -1,0 +1,130 @@
+import { describe, expect, it } from "vitest"
+import { expandFixedSlots, fixedSlotsClash, fixedSlotsOn, pendingFixedSlots } from "./fixed-slots"
+import { freeSlots } from "./slots"
+import { at } from "@/lib/time"
+import type { Appointment, FixedSlot } from "./types"
+
+const slot = (over: Partial<FixedSlot>): FixedSlot => ({
+  id: "f1",
+  staffId: "seba",
+  weekday: 2, // martes
+  onDate: null,
+  start: "18:00",
+  end: "19:00",
+  label: "Juan",
+  active: true,
+  ...over,
+})
+
+describe("upstream behavior 1", () => {
+  it("upstream behavior 2", () => {
+    const slots = [
+      slot({ id: "a", start: "19:00", end: "20:00" }), // martes
+      slot({ id: "b", start: "12:00", end: "13:00" }), // martes
+      slot({ id: "c", weekday: 3 }), // miércoles
+      slot({ id: "d", weekday: null, onDate: "2026-09-29", start: "15:00", end: "16:00" }), // ese martes puntual
+      slot({ id: "e", weekday: null, onDate: "2026-10-06" }), // otro martes
+    ]
+    expect(fixedSlotsOn(slots, "2026-09-29").map((s) => s.id)).toEqual(["b", "d", "a"])
+  })
+
+  it("los pausados no aparecen", () => {
+    expect(fixedSlotsOn([slot({ active: false })], "2026-09-29")).toEqual([])
+  })
+})
+
+describe("upstream behavior 3", () => {
+  const appt = (staffId: string, from: string, to: string, status: Appointment["status"] = "confirmado"): Appointment => ({
+    id: from + staffId, clientId: "c", staffId, serviceId: "s",
+    startsAt: at("2026-09-29", from).toISOString(), endsAt: at("2026-09-29", to).toISOString(),
+    status, source: "walk_in", price: 0, notes: null, conversationId: null, holdExpiresAt: null, createdAt: "",
+  })
+  const fijo = slot({ start: "18:00", end: "19:00" })
+
+  it("upstream behavior 4", () => {
+    expect(pendingFixedSlots([fijo], [])).toHaveLength(1)
+  })
+
+  it("upstream behavior 5", () => {
+    expect(pendingFixedSlots([fijo], [appt("seba", "18:00", "19:00")])).toEqual([])
+    expect(pendingFixedSlots([fijo], [appt("seba", "18:10", "19:10", "en_curso")])).toEqual([])
+  })
+
+  it("upstream behavior 6", () => {
+    // 16:35 a 17:35 contra un fijo de 18:00 a 19:00: no se tocan. Contra 17:15 a 18:00: 20 de 45 minutos.
+    const f = slot({ start: "17:15", end: "18:00" })
+    expect(pendingFixedSlots([f], [appt("seba", "16:35", "17:35")])).toHaveLength(1)
+    expect(pendingFixedSlots([f], [appt("seba", "17:10", "18:10")])).toEqual([]) // lo cubre entero
+  })
+
+  it("upstream behavior 7", () => {
+    expect(pendingFixedSlots([fijo], [appt("nemo", "18:00", "19:00")])).toHaveLength(1)
+    expect(pendingFixedSlots([fijo], [appt("seba", "16:00", "17:00")])).toHaveLength(1)
+    expect(pendingFixedSlots([fijo], [appt("seba", "18:00", "19:00", "cancelado")])).toHaveLength(1)
+  })
+})
+
+describe("upstream behavior 8", () => {
+  const f = (over: Partial<FixedSlot>) => slot({ start: "17:00", end: "17:45", ...over })
+
+  it("upstream behavior 9", () => {
+    expect(fixedSlotsClash(f({}), f({ start: "17:30", end: "18:15" }))).toBe(true)
+  })
+
+  it("pegados (uno termina cuando empieza el otro) no se pisan", () => {
+    expect(fixedSlotsClash(f({}), f({ start: "17:45", end: "18:30" }))).toBe(false)
+  })
+
+  it("upstream behavior 10", () => {
+    expect(fixedSlotsClash(f({}), f({ staffId: "nemo" }))).toBe(false)
+    expect(fixedSlotsClash(f({}), f({ weekday: 3 }))).toBe(false)
+  })
+
+  it("upstream behavior 11", () => {
+    // 2026-09-29 es martes; el semanal es de los martes.
+    expect(fixedSlotsClash(f({}), f({ weekday: null, onDate: "2026-09-29" }))).toBe(true)
+    expect(fixedSlotsClash(f({}), f({ weekday: null, onDate: "2026-09-30" }))).toBe(false) // miércoles
+  })
+})
+
+describe("upstream behavior 12", () => {
+  it("uno semanal cae todos los martes de la ventana", () => {
+    // 2026-09-29 es martes.
+    const blocks = expandFixedSlots([slot({})], "2026-09-29", 15)
+    expect(blocks).toHaveLength(3) // 29/9, 6/10, 13/10
+    expect(blocks[0].startsAt).toBe("2026-09-29T21:00:00.000Z") // 18:00 hora argentina (UTC−3)
+    expect(blocks[0].endsAt).toBe("2026-09-29T22:00:00.000Z")
+  })
+
+  it("upstream behavior 13", () => {
+    const blocks = expandFixedSlots([slot({ weekday: null, onDate: "2026-10-03" })], "2026-09-29", 30)
+    expect(blocks).toHaveLength(1)
+    expect(blocks[0].startsAt.slice(0, 10)).toBe("2026-10-03")
+  })
+
+  it("uno pausado no bloquea nada", () => {
+    expect(expandFixedSlots([slot({ active: false })], "2026-09-29", 30)).toEqual([])
+  })
+
+  it("upstream behavior 14", () => {
+    const blocks = expandFixedSlots([slot({})], "2026-09-29", 1)
+    const staff = {
+      id: "seba",
+      skipsServiceIds: [],
+      schedule: undefined,
+      timeOff: blocks.map((b) => ({ startsAt: b.startsAt, endsAt: b.endsAt })),
+    }
+    const free = freeSlots({
+      day: "2026-09-29",
+      service: { id: "corte", durationMin: 60 },
+      staff,
+      appointments: [],
+      stepMin: 60,
+      leadMin: 0,
+      now: new Date("2026-09-28T12:00:00Z"),
+    })
+    expect(free).not.toContain("18:00")
+    expect(free).toContain("17:00")
+    expect(free).toContain("19:00")
+  })
+})

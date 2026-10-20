@@ -1,0 +1,147 @@
+"use client"
+import { useEffect } from "react"
+import { normalizeLocale, translateText, type Locale } from "./messages"
+
+const ATTRS=["aria-label","title","placeholder"] as const
+type Canonical={english:string;last:string}
+const texts=new WeakMap<Text,Canonical>()
+const attrs=new WeakMap<Element,Map<string,Canonical>>()
+
+function selectedLocale():Locale{
+  try{
+    const stored=localStorage.getItem("booking_locale")
+    if(stored)return normalizeLocale(stored)
+    const cookie=document.cookie.match(/(?:^|;\s*)booking_locale=([^;]+)/)?.[1]
+    if(cookie)return normalizeLocale(decodeURIComponent(cookie))
+    return normalizeLocale(navigator.language)
+  }catch{return "en"}
+}
+function translateNode(node:Text,locale:Locale){
+  const parent=node.parentElement
+  if(!parent||parent.closest("script,style,code,pre,[contenteditable=true],[data-i18n-skip=true]"))return
+  const text=node.nodeValue||""
+  if(!text.trim())return
+  const existing=texts.get(node)
+  const canonical=existing && existing.last===text
+     ? existing.english : translateText(text,"en")
+  const rendered=translateText(canonical,locale)
+  texts.set(node,{english:canonical,last:rendered})
+  if(text!==rendered)node.nodeValue=rendered
+}
+function translateAttributes(el:Element,locale:Locale){
+  let saved=attrs.get(el)
+  if(!saved){saved=new Map();attrs.set(el,saved)}
+  for(const attr of ATTRS){
+    const v=el.getAttribute(attr)
+    if(!v)continue
+    const old=saved.get(attr)
+    const canonical=old && old.last===v ? old.english : translateText(v,"en")
+    const rendered=translateText(canonical,locale)
+    saved.set(attr,{english:canonical,last:rendered})
+    if(v!==rendered)el.setAttribute(attr,rendered)
+  }
+}
+function translateTree(root:Node,locale:Locale){
+  // Only the OUTSIDE shell is safe to localize on the Clients route.
+  // Client cards and their Suspense boundary are rendered by React with the
+  // locale passed from the server; mutating those nodes caused React #418.
+  if(location.pathname==="/clientes"){
+    if(root!==document.body)return
+    const shellNodes=[...document.body.querySelectorAll<HTMLElement>("aside,nav,.booking-app-header")]
+      .filter(el=>!el.closest("main"))
+    for(const element of new Set(shellNodes)){
+      translateAttributes(element,locale)
+      const walker=document.createTreeWalker(element,NodeFilter.SHOW_TEXT|NodeFilter.SHOW_ELEMENT)
+      let node:Node|null
+      while((node=walker.nextNode())){
+        if(node instanceof Text)translateNode(node,locale)
+        else if(node instanceof Element)translateAttributes(node,locale)
+      }
+    }
+    return
+  }
+  if(root instanceof Text){translateNode(root,locale);return}
+  if(!(root instanceof Element)&&root!==document.body)return
+  if(root instanceof Element)translateAttributes(root,locale)
+  const walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT|NodeFilter.SHOW_ELEMENT)
+  let node:Node|null
+  while((node=walker.nextNode())){
+    if(node instanceof Text)translateNode(node,locale)
+    else if(node instanceof Element)translateAttributes(node,locale)
+  }
+}
+export function LocaleBridge(){
+  useEffect(()=>{
+    let locale=selectedLocale()
+    let observer:MutationObserver|undefined
+    let active=true
+    let started=false
+    let clientStartTimer:number|undefined
+    let clientIdleTimer:number|undefined
+    let clientReadyPoll:number|undefined
+    const scheduleClientText=()=>{
+      if(clientIdleTimer!==undefined)window.clearTimeout(clientIdleTimer)
+      clientIdleTimer=window.setTimeout(()=>{
+        if(active&&location.pathname==="/clientes"&&document.documentElement.dataset.bookingClientsHydrated==="true"){
+          translateTree(document.body,locale)
+        }
+      },950)
+    }
+    const start=()=>{
+      if(!active||started)return
+      if(location.pathname==="/clientes"&&document.documentElement.dataset.bookingClientsHydrated!=="true")return
+      started=true
+      locale=selectedLocale()
+      document.documentElement.lang=locale
+      if(location.pathname==="/clientes")scheduleClientText()
+      else translateTree(document.body,locale)
+      observer=new MutationObserver(mutations=>{
+        // Next.js streamed client-directory segments can still hydrate after
+        // the first client component effect. Never rewrite their Text nodes
+        // in the same microtask as React's hydration.
+        if(location.pathname==="/clientes"){
+          scheduleClientText()
+          return
+        }
+        const visited=new Set<Node>()
+        for(const m of mutations){
+          if(m.type==="characterData"){
+            if(!visited.has(m.target)){visited.add(m.target);translateTree(m.target,locale)}
+          }else if(m.type==="attributes"){
+            if(!visited.has(m.target)){visited.add(m.target);translateTree(m.target,locale)}
+          }else{
+            for(const n of m.addedNodes){
+              if(visited.has(n))continue
+              visited.add(n)
+              translateTree(n,locale)
+            }
+          }
+        }
+      })
+      observer.observe(document.body,{subtree:true,characterData:true,childList:true,attributes:true,attributeFilter:[...ATTRS]})
+    }
+    // Client-only route may mount after the initial bridge effect: retry until ready.
+    clientReadyPoll=window.setInterval(()=>{if(!started&&active&&location.pathname==="/clientes"&&document.documentElement.dataset.bookingClientsHydrated==="true")start()},250)
+    // Hydrate the React streaming tree first. Changing server-rendered text while
+    // its client components are hydrating produces React #418 mismatches.
+    const timer=window.setTimeout(()=>{
+      if(location.pathname==="/clientes")clientStartTimer=window.setTimeout(start,950)
+      else start()
+    },450)
+    const onHydrated=()=>{
+      if(location.pathname==="/clientes"){
+        if(clientStartTimer!==undefined)window.clearTimeout(clientStartTimer)
+        clientStartTimer=window.setTimeout(start,950)
+      }else start()
+    }
+    window.addEventListener("booking:content-hydrated",onHydrated)
+    const onLocale=()=>{
+      locale=selectedLocale()
+      document.documentElement.lang=locale
+      if(observer)translateTree(document.body,locale)
+    }
+    window.addEventListener("booking:locale",onLocale)
+    return ()=>{active=false;clearTimeout(timer);if(clientStartTimer!==undefined)clearTimeout(clientStartTimer);if(clientIdleTimer!==undefined)clearTimeout(clientIdleTimer);if(clientReadyPoll!==undefined)clearInterval(clientReadyPoll);observer?.disconnect();window.removeEventListener("booking:locale",onLocale);window.removeEventListener("booking:content-hydrated",onHydrated)}
+  },[])
+  return null
+}
